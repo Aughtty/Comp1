@@ -69,9 +69,7 @@ public class ProfileEditorPanel extends JPanel {
         ctrlPanel.add(new JLabel("资源组:"), gbc);
         gbc.gridx = 1;
         groupCombo = new JComboBox<>();
-        groupCombo.addItem("G_PUBLIC_ACCESS");
-        groupCombo.addItem("G_TOP_SECRET");
-        groupCombo.addItem("G_FREE_DRINKS");
+        for (String g : db.getAllGroupNames()) groupCombo.addItem(g);
         ctrlPanel.add(groupCombo, gbc);
 
         gbc.gridx = 0; gbc.gridy = 1;

@@ -55,5 +55,10 @@ public class Simulator {
         return arp.processSwipe(badgeId, readerId);
     }
 
+    // hold badge for update
+    public AccessLog manualUpdate(String badgeId, String readerId) {
+        return arp.processBadgeUpdate(badgeId, readerId);
+    }
+
     public boolean isRunning() { return running; }
 }

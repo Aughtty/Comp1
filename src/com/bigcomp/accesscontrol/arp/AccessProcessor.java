@@ -3,29 +3,32 @@ package com.bigcomp.accesscontrol.arp;
 import com.bigcomp.accesscontrol.db.DB;
 import com.bigcomp.accesscontrol.log.CSVLogger;
 import com.bigcomp.accesscontrol.model.*;
-import com.bigcomp.accesscontrol.util.ProfileManager;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.temporal.ChronoUnit;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class AccessProcessor {
-    private DB db;
-    private CSVLogger csvLogger;
-    private ProfileManager profileManager;
-    private BadgeUpdateProcessor badgeUpdateProcessor;
-    private List<AccessEventListener> listeners = new ArrayList<>();
+    private final DB db;
+    private final CSVLogger csvLogger;
+    private final UsageTracker usageTracker = new UsageTracker();
+    private final Map<String, UsageTracker.Limits> limitConfig;
+    private final Map<String, Deque<AccessHistory>> histories = new ConcurrentHashMap<>();
+    private final int precedenceWindowMinutes = 30;
+    private final List<AccessEventListener> listeners = new ArrayList<>();
+    private final DateTimeFormatter timeFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
 
-    public AccessProcessor(DB db, CSVLogger csvLogger) { 
+    public AccessProcessor(DB db, CSVLogger csvLogger) {
         this.db = db;
         this.csvLogger = csvLogger;
-        this.profileManager = db.getProfileManager();
-        this.badgeUpdateProcessor = new BadgeUpdateProcessor(db);
+        this.limitConfig = loadUsageLimits();
     }
 
     public void addListener(AccessEventListener l) { listeners.add(l); }
 
+    // Normal swipe (open resource)
     public AccessLog processSwipe(String badgeId, String readerId) {
         AccessLog log = new AccessLog();
         log.setTimestamp(LocalDateTime.now());
@@ -38,14 +41,12 @@ public class AccessProcessor {
         if (!ob.isPresent()) {
             log.setResult("DENIED");
             log.setMessage("Badge not found");
-            log.setDenialReason("NOT_FOUND");
             logAndNotify(log, null);
             return log;
         }
         if (!or.isPresent()) {
             log.setResult("DENIED");
             log.setMessage("Reader not found");
-            log.setDenialReason("READER_NOT_FOUND");
             logAndNotify(log, null);
             return log;
         }
@@ -56,7 +57,6 @@ public class AccessProcessor {
         if (!osp.isPresent()) {
             log.setResult("DENIED");
             log.setMessage("Resource missing");
-            log.setDenialReason("RESOURCE_NOT_FOUND");
             logAndNotify(log, b);
             return log;
         }
@@ -65,193 +65,116 @@ public class AccessProcessor {
         log.setFromZoneId(res.getFromZoneId());
         log.setToZoneId(res.getToZoneId());
 
-        // ===== Check 0: Is Badge in Update Mode? =====
-        if (r.getUpdateMode() == 1) {
-            // Badge is being held for update, not swiped
-            return processBadgeUpdate(badgeId, readerId);
-        }
-
-        // ===== Check 0a: Is Resource Uncontrolled? =====
+        // If resource is uncontrolled, allow immediately
         if (!res.isControlled()) {
-            // Uncontrolled resources grant access immediately
             log.setResult("GRANTED");
-            log.setMessage("Access granted (uncontrolled resource)");
-            
-            // Update badge's current zone if moving through resource
-            String fromZone = res.getFromZoneId();
-            String toZone = res.getToZoneId();
-            if (fromZone != null && toZone != null && !toZone.equals(b.getCurrentZoneId())) {
-                db.updateBadgeCurrentZone(b.getBadgeId(), toZone);
-                b.setCurrentZoneId(toZone);
-            }
-            
+            log.setMessage("Resource currently uncontrolled");
             logAndNotify(log, b);
             return log;
         }
 
-        // ===== Check 1: Badge Basic Validity =====
+        // Basic badge checks
         if (!b.isActive()) {
             log.setResult("DENIED");
             log.setMessage("Badge inactive");
-            log.setDenialReason("INACTIVE");
             logAndNotify(log, b);
             return log;
         }
-
-        // ===== Check 2: Badge Update Status =====
-        String updateMessage = badgeUpdateProcessor.checkBadgeUpdateOnSwipe(b);
-        if (updateMessage != null) {
-            log.setResult("DENIED");
-            log.setMessage(updateMessage);
-            log.setDenialReason("UPDATE_REQUIRED");
-            logAndNotify(log, b);
-            return log;
-        }
-
-        // ===== Check 3: Badge Expiration =====
         if (b.getExpirationDate() != null && b.getExpirationDate().isBefore(LocalDate.now())) {
             log.setResult("DENIED");
             log.setMessage("Badge expired");
-            log.setDenialReason("EXPIRED");
             logAndNotify(log, b);
             return log;
         }
 
-        // ===== Check 4: Resource Group Verification =====
+        LocalDateTime now = log.getTimestamp();
+        if (b.isRequiresUpdate()) {
+            if (b.getUpdateGracePeriodEnd() != null && now.isAfter(b.getUpdateGracePeriodEnd())) {
+                log.setResult("DENIED");
+                log.setMessage("Badge disabled: update grace expired");
+                logAndNotify(log, b);
+                return log;
+            }
+            if (b.getUpdateDueDate() != null && now.isAfter(b.getUpdateDueDate())) {
+                log.setMessage("Badge must be updated (grace until " + fmt(b.getUpdateGracePeriodEnd()) + ")");
+            }
+        }
+
         Optional<String> og = db.findGroupForResource(res.getResourceId());
         if (!og.isPresent()) {
             log.setResult("DENIED");
             log.setMessage("Resource not in any group");
-            log.setDenialReason("NO_GROUP");
             logAndNotify(log, b);
             return log;
         }
         String group = og.get();
+        List<String> bProfiles = db.getProfilesForBadge(b.getBadgeId());
 
-        // ===== Check 5: Zone Transition Validity =====
-        String badgeZone = b.getCurrentZoneId();
-        if (badgeZone == null) badgeZone = "Z_OUTSIDE";
+        // Zone check
+        String badgeZone = b.getCurrentZoneId() == null ? "Z_OUTSIDE" : b.getCurrentZoneId();
         String fromZone = res.getFromZoneId();
         String toZone = res.getToZoneId();
-        
-        if (fromZone != null && !fromZone.equals(badgeZone)) {
-            log.setResult("DENIED");
-            log.setMessage("Badge not in entry zone. Current: " + badgeZone + ", Required: " + fromZone);
-            log.setDenialReason("WRONG_ZONE");
-            logAndNotify(log, b);
-            return log;
-        }
-
-        // ===== Check 6: Precedence Check =====
-        String precedenceError = checkPrecedence(b, res, group);
-        if (precedenceError != null) {
-            log.setResult("DENIED");
-            log.setMessage(precedenceError);
-            log.setDenialReason("PRECEDENCE_VIOLATION");
-            logAndNotify(log, b);
-            return log;
-        }
-
-        // ===== Check 7: Profile-Based Authorization with Time Filters =====
-        LocalDateTime accessTime = LocalDateTime.now();
-        List<String> badgeProfileNames = db.getProfilesForBadge(b.getBadgeId());
-        boolean allowed = false;
-        String denialReason = "No profile grants access to group " + group;
-        
-        for (String profileName : badgeProfileNames) {
-            Profile profile = profileManager.getProfile(profileName);
-            if (profile != null && profile.grantsAccess(group, accessTime)) {
-                allowed = true;
-                break;
-            }
-        }
-
-        if (!allowed) {
-            log.setResult("DENIED");
-            log.setMessage(denialReason);
-            log.setDenialReason("NO_PERMISSION");
-            logAndNotify(log, b);
-            return log;
-        }
-
-        // ===== Check 8: Usage Count Limits =====
-        int dailyLimit = getResourceGroupDailyLimit(group);
-        if (dailyLimit > 0) {
-            int used = db.getAccessCountInWindow(b.getBadgeId(), group, "DAILY");
-            if (used >= dailyLimit) {
+        if (fromZone != null || toZone != null) {
+            boolean inAllowedZone = (fromZone != null && fromZone.equals(badgeZone)) ||
+                    (toZone != null && toZone.equals(badgeZone));
+            if (!inAllowedZone) {
                 log.setResult("DENIED");
-                log.setMessage("Daily usage limit reached (" + used + "/" + dailyLimit + ")");
-                log.setDenialReason("USAGE_LIMIT_EXCEEDED");
+                log.setMessage("Badge not in allowed zone");
                 logAndNotify(log, b);
                 return log;
             }
         }
 
-        // ===== All Checks Passed: Grant Access =====
-        log.setResult("GRANTED");
-        log.setMessage("Access granted");
-        
-        // Increment usage counter
-        if (dailyLimit > 0) {
-            db.incrementUsageCount(b.getBadgeId(), group);
+        if (!checkPrecedence(b, res, now)) {
+            log.setResult("DENIED");
+            log.setMessage("Precedence rule: enter parent zone first");
+            logAndNotify(log, b);
+            return log;
         }
-        
-        // Update badge's current zone if moving through resource
-        if (fromZone != null && toZone != null && !toZone.equals(badgeZone)) {
+
+        boolean allowed = hasProfileAccess(bProfiles, group, now);
+        if (!allowed) {
+            log.setResult("DENIED");
+            log.setMessage("No profile/time window for group " + group);
+            logAndNotify(log, b);
+            return log;
+        }
+
+        // Usage limits
+        UsageTracker.Limits limits = limitConfig.getOrDefault(group, new UsageTracker.Limits(0,0,0));
+        if (limits.perDay > 0) {
+            int usedToday = db.getUsageCountToday(b.getBadgeId(), group);
+            if (usedToday >= limits.perDay) {
+                log.setResult("DENIED");
+                log.setMessage("Daily limit reached (" + usedToday + "/" + limits.perDay + ")");
+                logAndNotify(log, b);
+                return log;
+            }
+        }
+        Optional<String> limitMsg = usageTracker.checkAndIncrement(b.getBadgeId(), group, limits, now);
+        if (limitMsg.isPresent()) {
+            log.setResult("DENIED");
+            log.setMessage(limitMsg.get());
+            logAndNotify(log, b);
+            return log;
+        }
+
+        // Granted
+        log.setResult("GRANTED");
+        if (log.getMessage() == null) log.setMessage("Access granted");
+        if (limits.perDay > 0) db.incrementUsageCount(b.getBadgeId(), group);
+
+        if (fromZone != null && toZone != null && fromZone.equals(badgeZone) && !toZone.equals(badgeZone)) {
             db.updateBadgeCurrentZone(b.getBadgeId(), toZone);
             b.setCurrentZoneId(toZone);
+            recordHistory(b.getBadgeId(), fromZone, toZone, res.getResourceId(), now);
         }
-        
-        // Record access history for precedence checks
-        db.recordAccessHistory(b.getBadgeId(), fromZone, toZone, res.getResourceId(), "GRANTED");
 
         logAndNotify(log, b);
         return log;
     }
 
-    /**
-     * Check precedence rules
-     * Example: Must enter Building before accessing Lab inside Building
-     */
-    private String checkPrecedence(Badge badge, Resource resource, String group) {
-        // For now, a simple check: if accessing a secure zone, must have recently accessed building
-        String toZone = resource.getToZoneId();
-        
-        // High-security zones may require prior zone access
-        if (toZone != null && toZone.contains("LAB")) {
-            Optional<AccessHistory> lastAccess = db.getMostRecentAccess(badge.getBadgeId());
-            if (!lastAccess.isPresent()) {
-                return "Must enter building before accessing lab";
-            }
-            
-            AccessHistory ah = lastAccess.get();
-            LocalDateTime now = LocalDateTime.now();
-            long minutesSinceLastAccess = ChronoUnit.MINUTES.between(ah.getAccessTime(), now);
-            
-            // Allow if accessed building within last 2 hours
-            if (minutesSinceLastAccess > 120) {
-                return "Must re-enter building to access lab";
-            }
-        }
-        
-        return null; // No precedence violation
-    }
-
-    /**
-     * Get daily usage limit for a resource group
-     */
-    private int getResourceGroupDailyLimit(String groupName) {
-        // Hardcoded limits - in production, store in database
-        Map<String, Integer> limits = new HashMap<>();
-        limits.put("G_FREE_DRINKS", 5);
-        limits.put("G_PUBLIC_ACCESS", Integer.MAX_VALUE);
-        limits.put("G_TOP_SECRET", Integer.MAX_VALUE);
-        return limits.getOrDefault(groupName, 0);
-    }
-
-    /**
-     * Process badge update (badge held to reader)
-     */
+    // Hold badge to update code
     public AccessLog processBadgeUpdate(String badgeId, String readerId) {
         AccessLog log = new AccessLog();
         log.setTimestamp(LocalDateTime.now());
@@ -259,31 +182,102 @@ public class AccessProcessor {
         log.setReaderId(readerId);
 
         Optional<Badge> ob = db.findBadge(badgeId);
-        if (!ob.isPresent()) {
-            log.setResult("DENIED");
-            log.setMessage("Badge not found");
-            logAndNotify(log, null);
+        Optional<Reader> or = db.findReader(readerId);
+        if (!ob.isPresent()) { log.setResult("DENIED"); log.setMessage("Badge not found"); logAndNotify(log, null); return log; }
+        if (!or.isPresent()) { log.setResult("DENIED"); log.setMessage("Reader not found"); logAndNotify(log, null); return log; }
+        Badge b = ob.get();
+
+        if (!b.isRequiresUpdate()) {
+            log.setResult("GRANTED");
+            log.setMessage("Badge does not require update");
+            logAndNotify(log, b);
             return log;
         }
 
-        Badge b = ob.get();
-        String updateMessage = badgeUpdateProcessor.processBadgeUpdate(b);
-        
-        if (updateMessage.contains("successfully")) {
-            log.setResult("GRANTED");
-        } else {
+        LocalDateTime now = log.getTimestamp();
+        if (b.getUpdateGracePeriodEnd() != null && now.isAfter(b.getUpdateGracePeriodEnd())) {
             log.setResult("DENIED");
+            log.setMessage("Update window expired");
+            logAndNotify(log, b);
+            return log;
         }
-        log.setMessage(updateMessage);
-        
+
+        b.setRequiresUpdate(false);
+        b.setLastUpdateTime(now);
+        b.setUpdateDueDate(now.plusMonths(3));
+        b.setUpdateGracePeriodEnd(now.plusMonths(3).plusDays(7));
+        db.updateBadgeUpdateStatus(b);
+
+        log.setResult("GRANTED");
+        log.setMessage("Badge updated successfully");
         logAndNotify(log, b);
         return log;
     }
 
+    private boolean hasProfileAccess(List<String> profileNames, String group, LocalDateTime now) {
+        for (String p : profileNames) {
+            if ("P_ADMIN".equalsIgnoreCase(p)) return true;
+            Optional<Profile> op = db.findProfileByName(p);
+            if (!op.isPresent()) continue;
+            for (AccessRight r : op.get().getRights()) {
+                if (group.equals(r.getGroupName()) && r.getTimeFilter().matches(now)) return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean checkPrecedence(Badge badge, Resource res, LocalDateTime now) {
+        String from = res.getFromZoneId();
+        if (from == null || "Z_OUTSIDE".equalsIgnoreCase(from)) return true;
+        Deque<AccessHistory> deque = histories.getOrDefault(badge.getBadgeId(), new ArrayDeque<>());
+        for (AccessHistory h : deque) {
+            if (from.equals(h.getToZoneId()) && !h.getAccessTime().isBefore(now.minusMinutes(precedenceWindowMinutes))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void recordHistory(String badgeId, String from, String to, String resId, LocalDateTime now) {
+        histories.computeIfAbsent(badgeId, k -> new ArrayDeque<>());
+        Deque<AccessHistory> deque = histories.get(badgeId);
+        deque.addFirst(new AccessHistory(badgeId, from, to, resId, now));
+        while (deque.size() > 50) deque.removeLast();
+    }
+
+    private Map<String, UsageTracker.Limits> loadUsageLimits() {
+        Map<String, UsageTracker.Limits> map = new HashMap<>();
+        java.io.File f = new java.io.File("data/usage_limits.properties");
+        if (f.exists()) {
+            Properties p = new Properties();
+            try (java.io.FileInputStream fis = new java.io.FileInputStream(f)) { p.load(fis); } catch (Exception ignored) { }
+            for (String name : p.stringPropertyNames()) {
+                String[] arr = name.split("\\.");
+                if (arr.length != 2) continue;
+                String group = arr[0];
+                UsageTracker.Limits old = map.getOrDefault(group, new UsageTracker.Limits(0,0,0));
+                int val = Integer.parseInt(p.getProperty(name));
+                UsageTracker.Limits nu = old;
+                switch (arr[1]) {
+                    case "perDay": nu = new UsageTracker.Limits(val, old.perWeek, old.perMonth); break;
+                    case "perWeek": nu = new UsageTracker.Limits(old.perDay, val, old.perMonth); break;
+                    case "perMonth": nu = new UsageTracker.Limits(old.perDay, old.perWeek, val); break;
+                }
+                map.put(group, nu);
+            }
+        }
+        // defaults
+        map.putIfAbsent("G_FREE_DRINKS", new UsageTracker.Limits(3, 10, 30));
+        return map;
+    }
+
+    private String fmt(LocalDateTime ldt) {
+        return ldt == null ? "?" : ldt.format(timeFmt);
+    }
+
     private void logAndNotify(AccessLog log, Badge badge) {
         db.insertAccessLog(log);
-        
-        // Also log to CSV with user info
+
         String userName = "Unknown";
         if (badge != null) {
             log.setUserId(badge.getUserId());
@@ -293,7 +287,7 @@ public class AccessProcessor {
             }
         }
         csvLogger.logAccess(log, userName);
-        
+
         notifyListeners(log);
     }
 

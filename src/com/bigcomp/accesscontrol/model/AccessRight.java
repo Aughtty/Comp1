@@ -1,43 +1,29 @@
 package com.bigcomp.accesscontrol.model;
 
-import com.bigcomp.accesscontrol.util.TimeFilter;
-
-/**
- * AccessRight represents a permission to access a resource group during certain times.
- * Example: (G_PUBLIC_ACCESS, 2025.July,August.Monday-Friday.8:00-12:00,14:00-17:00)
- */
+/** Pair of resource group and time filter */
 public class AccessRight {
-    private String groupName;
-    private TimeFilter timeFilter;
-    private String timeFilterRule;  // Store original rule for serialization
+    private final String groupName;
+    private final TimeFilter timeFilter;
+    private final String timeRuleText;
 
-    public AccessRight(String groupName, String timeFilterRule) throws IllegalArgumentException {
+    public AccessRight(String groupName, String timeRule) {
+        this(groupName, TimeFilter.parse(timeRule), timeRule);
+    }
+
+    public AccessRight(String groupName, TimeFilter filter) {
+        this(groupName, filter, "ALL.ALL.ALL.ALL");
+    }
+
+    public AccessRight(String groupName, TimeFilter filter, String rawRule) {
+        if (groupName == null || groupName.isEmpty()) {
+            throw new IllegalArgumentException("groupName cannot be empty");
+        }
         this.groupName = groupName;
-        this.timeFilterRule = timeFilterRule;
-        this.timeFilter = new TimeFilter(timeFilterRule);
+        this.timeFilter = filter == null ? TimeFilter.parse("ALL.ALL.ALL.ALL") : filter;
+        this.timeRuleText = (rawRule == null || rawRule.isEmpty()) ? "ALL.ALL.ALL.ALL" : rawRule;
     }
 
-    public String getGroupName() {
-        return groupName;
-    }
-
-    public TimeFilter getTimeFilter() {
-        return timeFilter;
-    }
-
-    public String getTimeFilterRule() {
-        return timeFilterRule;
-    }
-
-    /**
-     * Check if this access right is valid at the given time
-     */
-    public boolean isValidAtTime(java.time.LocalDateTime dateTime) {
-        return timeFilter.matches(dateTime);
-    }
-
-    @Override
-    public String toString() {
-        return groupName + " (" + timeFilterRule + ")";
-    }
+    public String getGroupName() { return groupName; }
+    public TimeFilter getTimeFilter() { return timeFilter; }
+    public String getTimeRuleText() { return timeRuleText; }
 }

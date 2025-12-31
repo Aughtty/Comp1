@@ -1,0 +1,14 @@
+时间过滤规则引擎 - 创建 TimeFilter.java，支持复杂规则如 2025.July,August.Monday-Friday.8:00-12:00 和 EXCEPT 语法
+
+Profile 档案系统 - 新增 Profile.java + AccessRight.java，档案保存到 data/profiles/ 文件，支持图形化编辑
+
+徽章更新流程 - Badge 新增更新字段，实现"持卡更新"功能，带宽限期逻辑，文件持久化（data/badge_updates.csv）
+
+访问限制 + 先后顺序
+
+UsageTracker.java 实现日/周/月限次（data/usage_tracker.csv）
+AccessHistory 实现先后顺序检查（30分钟窗口）
+可配置限次（data/usage_limits.properties）
+资源批量控制（疏散模式） - ControlPanel 新增组选择器 + 按钮，一键切换受控/非受控
+
+报表高级筛选 - ReportsPanel 支持时间范围、Badge/Reader/Resource、结果等多维度筛选
