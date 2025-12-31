@@ -1,0 +1,10 @@
+LvBingqin 2025248043(Backend & Database Engineer):
+Implemented the core database layer including MySQL connectivity, table schema design (7 tables for badges, readers, resources, groups, profiles, logs, users), and data persistence mechanisms. Developed the AccessProcessor (ARP) to handle badge swipe events with validations for badge existence, activation status, and expiration dates. Created TimeFilter system capable of parsing complex time rules with support for year/month/day/hour ranges, EXCEPT semantics, and ALL wildcards. Built ProfileManager for managing user access profiles and configured CSV-based logging system with automatic directory structure organization (logs/YYYY/MM_MONTHNAME/).
+
+KuaiJunce 2025248042(UI/Frontend Developer):
+Designed and implemented comprehensive graphical user interface using Java Swing, including MainWindow with tabbed interface (Monitor/Admin/Users/Reports). Created MapPanel for real-time visualization of site layout with badge reader positions, green/red flashing indicators for access grants/denials, and support for multiple map images. Built ControlPanel with manual badge swipe input, automatic simulator controls, speed adjustment slider, and live access log display. Developed AdminPanel for badge management and revocation, ReportsPanel for CSV log viewing with date filtering, and UserManagementPanel. All UI components include real-time event listeners for system integration.
+
+WangZirui 2025248037(System Architecture & Testing):
+Designed overall system architecture following MVC pattern with clear separation between model layer (Badge, Reader, Resource, User, Profile classes), business logic layer (AccessProcessor, TimeFilter, ProfileManager), and presentation layer (all UI components). Established project structure with proper package organization (com.bigcomp.accesscontrol.{db,model,arp,ui,sim,log,util}), created batch scripts for compilation and execution, configured MySQL database with proper schema, and implemented event-driven architecture using PropertyChangeListener patterns. Initiated testing framework and performance considerations for scalability with 300 badges and 400 badge readers.
+
+

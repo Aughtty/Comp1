@@ -1,0 +1,213 @@
+-- =============================================
+-- PART 0: 清理环境 (Reset Environment)
+-- =============================================
+-- 暂时禁用外键检查，以便顺利删除有相互依赖的表
+SET FOREIGN_KEY_CHECKS = 0;
+
+-- 按照依赖关系的逆序删除表 (虽然关了FK检查，但保持这个习惯很好)
+DROP TABLE IF EXISTS UsageCounters;
+DROP TABLE IF EXISTS Group_Resources;
+DROP TABLE IF EXISTS Badge_Profiles;
+DROP TABLE IF EXISTS Profiles;
+DROP TABLE IF EXISTS ResourceGroups;
+DROP TABLE IF EXISTS Resources;
+DROP TABLE IF EXISTS BadgeReaders;
+DROP TABLE IF EXISTS Badges;
+DROP TABLE IF EXISTS Users;
+DROP TABLE IF EXISTS Zones;
+
+-- 重新启用外键检查
+SET FOREIGN_KEY_CHECKS = 1;
+
+
+-- =============================================
+-- PART 1: 重建表结构 (Schema Creation)
+-- =============================================
+
+-- 1. 基础字典表 (Zones)
+CREATE TABLE Zones (
+    zone_id VARCHAR(50) PRIMARY KEY,
+    description VARCHAR(255)
+);
+
+-- 2. 用户表 (Users) - 此时不加 current_badge_id 的外键约束，防止死锁
+CREATE TABLE Users (
+    user_id VARCHAR(50) PRIMARY KEY,
+    id_number VARCHAR(50) UNIQUE,
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    gender VARCHAR(20), 
+    current_badge_id VARCHAR(50) 
+);
+
+-- 3. 徽章表 (Badges)
+CREATE TABLE Badges (
+    badge_id VARCHAR(50) PRIMARY KEY,
+    user_id VARCHAR(50),
+    creation_date DATE,
+    expiration_date DATE,
+    last_update_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT TRUE,
+    current_zone_id VARCHAR(50) DEFAULT 'Z_OUTSIDE',
+    
+    FOREIGN KEY (user_id) REFERENCES Users(user_id) ON DELETE SET NULL,
+    FOREIGN KEY (current_zone_id) REFERENCES Zones(zone_id)
+);
+
+-- *现在*添加 Users 的循环外键约束
+ALTER TABLE Users ADD CONSTRAINT fk_user_current_badge 
+    FOREIGN KEY (current_badge_id) REFERENCES Badges(badge_id) ON DELETE SET NULL;
+
+-- 4. 读卡器表 (BadgeReaders)
+CREATE TABLE BadgeReaders (
+    reader_id VARCHAR(50) PRIMARY KEY,
+    resource_id VARCHAR(50), 
+    ui_map_layer INT DEFAULT 0,
+    ui_x_coord INT DEFAULT 0,
+    ui_y_coord INT DEFAULT 0
+);
+
+-- 5. 资源表 (Resources)
+CREATE TABLE Resources (
+    resource_id VARCHAR(50) PRIMARY KEY,
+    reader_id VARCHAR(50),
+    name VARCHAR(100),
+    location VARCHAR(255),
+    state VARCHAR(20) DEFAULT 'CONTROLLED',
+    resource_type VARCHAR(20) NOT NULL, -- 'DOOR', 'DEVICE'
+    from_zone_id VARCHAR(50), 
+    to_zone_id VARCHAR(50),
+    
+    FOREIGN KEY (reader_id) REFERENCES BadgeReaders(reader_id) ON DELETE SET NULL,
+    FOREIGN KEY (from_zone_id) REFERENCES Zones(zone_id),
+    FOREIGN KEY (to_zone_id) REFERENCES Zones(zone_id)
+);
+
+-- *现在*添加 BadgeReaders 的资源外键约束
+ALTER TABLE BadgeReaders ADD CONSTRAINT fk_reader_resource 
+    FOREIGN KEY (resource_id) REFERENCES Resources(resource_id) ON DELETE CASCADE;
+
+-- 6. 配置组 (ResourceGroups)
+CREATE TABLE ResourceGroups (
+    group_name VARCHAR(100) PRIMARY KEY,
+    security_level INT,
+    file_path VARCHAR(255),
+    description VARCHAR(255)
+);
+
+-- 7. 权限配置文件 (Profiles)
+CREATE TABLE Profiles (
+    profile_name VARCHAR(100) PRIMARY KEY,
+    file_path VARCHAR(255),
+    description VARCHAR(255)
+);
+
+-- 8. 关联表: 徽章-配置 (Badge_Profiles)
+CREATE TABLE Badge_Profiles (
+    badge_id VARCHAR(50),
+    profile_name VARCHAR(100),
+    PRIMARY KEY (badge_id, profile_name),
+    FOREIGN KEY (badge_id) REFERENCES Badges(badge_id) ON DELETE CASCADE,
+    FOREIGN KEY (profile_name) REFERENCES Profiles(profile_name) ON DELETE CASCADE
+);
+
+-- 9. 关联表: 组-资源 (Group_Resources)
+CREATE TABLE Group_Resources (
+    group_name VARCHAR(100),
+    resource_id VARCHAR(50),
+    PRIMARY KEY (group_name, resource_id),
+    FOREIGN KEY (group_name) REFERENCES ResourceGroups(group_name) ON DELETE CASCADE,
+    FOREIGN KEY (resource_id) REFERENCES Resources(resource_id) ON DELETE CASCADE
+);
+
+-- 10. 计数器 (UsageCounters)
+CREATE TABLE UsageCounters (
+    counter_id INT AUTO_INCREMENT PRIMARY KEY,
+    badge_id VARCHAR(50) NOT NULL,
+    group_name VARCHAR(100) NOT NULL,
+    usage_count INT DEFAULT 0,
+    last_usage_date DATE NOT NULL,
+    UNIQUE KEY unique_usage (badge_id, group_name),
+    FOREIGN KEY (badge_id) REFERENCES Badges(badge_id) ON DELETE CASCADE,
+    FOREIGN KEY (group_name) REFERENCES ResourceGroups(group_name) ON DELETE CASCADE
+);
+
+
+-- =============================================
+-- PART 2: 插入测试数据 (Data Seeding)
+-- =============================================
+
+-- 1. 插入区域 (必须最先插入，因为 Badges 依赖它)
+INSERT INTO Zones (zone_id, description) VALUES 
+('Z_OUTSIDE', 'Campus Outside / Public Area'),
+('Z_LOBBY', 'Main Building Lobby'),
+('Z_LAB_SECURE', 'High Security Research Lab'),
+('Z_CAFETERIA', 'Staff Cafeteria');
+
+-- 2. 插入用户 (此时 current_badge_id 先设为 NULL)
+INSERT INTO Users (user_id, id_number, first_name, last_name, gender, current_badge_id) VALUES 
+('usr_001', 'ID_998877', 'Bruce', 'Wayne', 'Male', NULL),
+('usr_002', 'ID_112233', 'Diana', 'Prince', 'Female', NULL),
+('usr_003', 'ID_555666', 'Clark', 'Kent', 'Male', NULL);
+
+-- 3. 插入徽章 (现在已有 Zone 和 User，可以插入 Badge)
+INSERT INTO Badges (badge_id, user_id, creation_date, expiration_date, is_active, current_zone_id) VALUES 
+('bdg_bat', 'usr_001', '2023-01-01', '2025-12-31', TRUE, 'Z_OUTSIDE'),
+('bdg_ww',  'usr_002', '2023-05-15', '2026-05-15', TRUE, 'Z_LOBBY'),
+('bdg_sup', 'usr_003', '2023-08-20', '2024-08-20', FALSE, 'Z_OUTSIDE'); -- 过期/停用的卡
+
+-- 4. [关键步骤] 回填 Users 表的 current_badge_id
+-- 因为这是循环依赖，必须在两个表的数据都存在后，用 UPDATE 关联起来
+UPDATE Users SET current_badge_id = 'bdg_bat' WHERE user_id = 'usr_001';
+UPDATE Users SET current_badge_id = 'bdg_ww'  WHERE user_id = 'usr_002';
+UPDATE Users SET current_badge_id = 'bdg_sup' WHERE user_id = 'usr_003';
+
+-- 5. 插入读卡器 (BadgeReaders)
+INSERT INTO BadgeReaders (reader_id, ui_map_layer, ui_x_coord, ui_y_coord) VALUES
+('rdr_front_door', 0, 100, 250),
+('rdr_lab_entry',  1, 500, 300),
+('rdr_coke_machine', 1, 600, 600);
+
+-- 6. 插入资源 (Resources) - 关联读卡器和区域
+INSERT INTO Resources (resource_id, reader_id, name, location, resource_type, from_zone_id, to_zone_id) VALUES 
+-- 大门：从外部(Outside)进入大厅(Lobby)
+('res_main_gate', 'rdr_front_door', 'Main Entrance Gate', 'Building A Entry', 'DOOR', 'Z_OUTSIDE', 'Z_LOBBY'),
+-- 实验室门：从大厅(Lobby)进入实验室(Lab)
+('res_lab_door', 'rdr_lab_entry', 'Secret Lab Door', 'Building A Floor 2', 'DOOR', 'Z_LOBBY', 'Z_LAB_SECURE'),
+-- 售货机：仅设备操作，不移动区域 (to_zone_id = NULL 或 与 from 相同)
+('res_vending_01', 'rdr_coke_machine', 'Free Coke Machine', 'Cafeteria Corner', 'DEVICE', 'Z_CAFETERIA', 'Z_CAFETERIA');
+
+-- 7. [关键步骤] 回填 BadgeReaders 的 resource_id
+UPDATE BadgeReaders SET resource_id = 'res_main_gate' WHERE reader_id = 'rdr_front_door';
+UPDATE BadgeReaders SET resource_id = 'res_lab_door'  WHERE reader_id = 'rdr_lab_entry';
+UPDATE BadgeReaders SET resource_id = 'res_vending_01' WHERE reader_id = 'rdr_coke_machine';
+
+-- 8. 插入配置组 (ResourceGroups) 和 配置文件 (Profiles)
+INSERT INTO ResourceGroups (group_name, security_level, file_path, description) VALUES
+('G_PUBLIC_ACCESS', 1, '/config/groups/public.json', 'Access to lobby and cafeteria'),
+('G_TOP_SECRET', 5, '/config/groups/secret.json', 'Access to secure labs'),
+('G_FREE_DRINKS', 1, '/config/groups/vending.json', 'Vending machine allowance');
+
+INSERT INTO Profiles (profile_name, file_path, description) VALUES
+('P_EMPLOYEE', '/config/profiles/employee_std.xml', 'Standard Employee'),
+('P_ADMIN', '/config/profiles/admin_full.xml', 'System Administrator');
+
+-- 9. 插入关联数据
+-- 9.1 组包含哪些资源 (Group_Resources)
+INSERT INTO Group_Resources (group_name, resource_id) VALUES
+('G_PUBLIC_ACCESS', 'res_main_gate'),
+('G_TOP_SECRET', 'res_lab_door'),
+('G_FREE_DRINKS', 'res_vending_01');
+
+-- 9.2 徽章拥有哪些 Profile (Badge_Profiles)
+-- Bruce Wayne (Admin)
+INSERT INTO Badge_Profiles (badge_id, profile_name) VALUES ('bdg_bat', 'P_ADMIN');
+-- Diana (Employee)
+INSERT INTO Badge_Profiles (badge_id, profile_name) VALUES ('bdg_ww', 'P_EMPLOYEE');
+
+-- 10. 插入计数器 (模拟 Bruce 已经喝了 2 杯饮料)
+INSERT INTO UsageCounters (badge_id, group_name, usage_count, last_usage_date) VALUES 
+('bdg_bat', 'G_FREE_DRINKS', 2, CURRENT_DATE);
+
+-- 脚本结束，输出成功信息 (部分SQL客户端支持)
+-- SELECT 'Database reset and seeded successfully!' AS status;

@@ -1,0 +1,1 @@
+Place your floor images here as `1.png` and `2.png` (the UI loads `resources/img/1.png` by default). Replace these with the images you provided to see the actual map.
